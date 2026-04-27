@@ -24,8 +24,21 @@ const FALLBACK = {
   intencao: "neutro",
   confianca: 0.3,
   sinais: [],
-  ambiguidade: "falha de classificação — fallback aplicado"
+  ambiguidade: "falha de classificação — fallback aplicado",
+  tarefas_extraidas: null,
+  indices_concluidos: null
 };
+
+const INTENCOES_VALIDAS = [
+  "declarou_tarefas",
+  "concluiu_especifica",
+  "concluiu",
+  "falhou",
+  "neutro",
+  "duvida",
+  "fora_escopo",
+  "crise"
+];
 
 function extrairJSON(texto) {
   // Remove cercas de markdown se existirem
@@ -43,7 +56,7 @@ export async function classificarIntencao(mensagemUsuario) {
   try {
     const resp = await client.messages.create({
       model: CLASSIFIER_MODEL,
-      max_tokens: 250,
+      max_tokens: 350,
       temperature: 0,
       system: CLASSIFIER_SYSTEM,
       messages: [{ role: "user", content: mensagemUsuario }]
@@ -52,16 +65,7 @@ export async function classificarIntencao(mensagemUsuario) {
     const texto = resp.content?.[0]?.text || "";
     const parsed = extrairJSON(texto);
 
-    // Validação mínima do shape
-    const intencoesValidas = [
-      "concluiu",
-      "falhou",
-      "neutro",
-      "duvida",
-      "fora_escopo",
-      "crise"
-    ];
-    if (!intencoesValidas.includes(parsed.intencao)) {
+    if (!INTENCOES_VALIDAS.includes(parsed.intencao)) {
       console.warn("classifier: intenção inválida, usando fallback", parsed);
       return FALLBACK;
     }
@@ -70,7 +74,15 @@ export async function classificarIntencao(mensagemUsuario) {
       intencao: parsed.intencao,
       confianca: Number(parsed.confianca) || 0.5,
       sinais: Array.isArray(parsed.sinais) ? parsed.sinais : [],
-      ambiguidade: parsed.ambiguidade || null
+      ambiguidade: parsed.ambiguidade || null,
+      tarefas_extraidas: Array.isArray(parsed.tarefas_extraidas)
+        ? parsed.tarefas_extraidas.filter((s) => typeof s === "string" && s.trim())
+        : null,
+      indices_concluidos: Array.isArray(parsed.indices_concluidos)
+        ? parsed.indices_concluidos.filter(
+            (x) => typeof x === "number" || typeof x === "string"
+          )
+        : null
     };
   } catch (err) {
     console.error("classifier: erro na chamada", err.message);

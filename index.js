@@ -1,6 +1,7 @@
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import cron from "node-cron";
 
 import { detectarCriseCritica, RESPOSTA_CRISE } from "./bot/safety.js";
 import { classificarIntencao } from "./bot/classifier.js";
@@ -9,6 +10,16 @@ import {
   extrairAbertura,
   formatarParaTelegram
 } from "./bot/responder.js";
+import {
+  getUser,
+  updateUser,
+  pushAbertura,
+  addTarefas,
+  marcarTarefasFeitas,
+  descartarTarefa,
+  getTarefasPendentes,
+  listarChatIds
+} from "./bot/storage.js";
 
 dotenv.config();
 
@@ -16,34 +27,13 @@ const app = express();
 app.use(express.json());
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}`;
+const TIMEZONE = process.env.TIMEZONE || "America/Sao_Paulo";
+const CHECKIN_CRON = process.env.CHECKIN_CRON || "0 8 * * *"; // 8h no fuso TIMEZONE
 
-// 🔥 MEMÓRIA (em-memória; sobrevive enquanto o processo rodar)
-const memoria = {};
+// ---------------- Helpers ----------------
 
-// Helpers
 function hoje() {
   return new Date().toISOString().split("T")[0];
-}
-
-function getUser(chatId) {
-  if (!memoria[chatId]) {
-    memoria[chatId] = {
-      score: 50,
-      streak: 0,
-      ultimoCheck: null,
-      executouHoje: false,
-      tarefas: [],
-      ultimas_3_aberturas: [],
-      em_modo_seguro: false,
-      ultima_classificacao_crise: null
-    };
-  }
-  return memoria[chatId];
-}
-
-function pushAbertura(user, abertura) {
-  if (!abertura) return;
-  user.ultimas_3_aberturas = [...(user.ultimas_3_aberturas || []), abertura].slice(-3);
 }
 
 async function enviarTelegram(chatId, texto, html = false) {
@@ -54,7 +44,119 @@ async function enviarTelegram(chatId, texto, html = false) {
   });
 }
 
-// 🔥 WEBHOOK
+function enriquecerPendentes(pendentes) {
+  const hojeData = new Date(hoje());
+  return pendentes.map((t, i) => {
+    const criada = new Date(t.criadaEm);
+    const idade = Math.max(
+      0,
+      Math.round((hojeData - criada) / (1000 * 60 * 60 * 24))
+    );
+    return { n: i + 1, texto: t.texto, idade_dias: idade };
+  });
+}
+
+function formatarPendentes(enriquecidas) {
+  if (!enriquecidas.length) return "";
+  return enriquecidas
+    .map((t) => {
+      const idade = t.idade_dias > 0 ? ` (${t.idade_dias}d parada)` : "";
+      return `${t.n}. ${t.texto}${idade}`;
+    })
+    .join("\n");
+}
+
+// Reset diário: se mudou de dia, atualiza streak/score
+function resetDiarioSeNecessario(user, userId) {
+  const hojeData = hoje();
+  if (user.ultimo_check === hojeData) return user;
+
+  const updates = { ultimo_check: hojeData };
+  if (user.executou_hoje) {
+    updates.streak = (user.streak || 0) + 1;
+  } else if (user.ultimo_check !== null) {
+    updates.streak = 0;
+    updates.score = Math.max((user.score || 50) - 5, 0);
+  }
+  updates.executou_hoje = false;
+  return updateUser(userId, updates);
+}
+
+// Comandos diretos (sem LLM). Retorna true se tratou.
+async function tratarComando(chatId, userText) {
+  const t = userText.trim().toLowerCase();
+
+  if (t === "pendentes" || t === "/pendentes" || t === "lista") {
+    const pendentes = getTarefasPendentes(chatId, 3);
+    if (!pendentes.length) {
+      await enviarTelegram(chatId, "Sem pendentes nos últimos 3 dias.");
+    } else {
+      const enriquecidas = enriquecerPendentes(pendentes);
+      await enviarTelegram(
+        chatId,
+        `Pendentes:\n${formatarPendentes(enriquecidas)}`
+      );
+    }
+    return true;
+  }
+
+  // Descartar tarefa: "descarta 2" / "descartar relatório"
+  const mDescarta = t.match(/^descart[ar]+\s+(.+)$/);
+  if (mDescarta) {
+    const arg = mDescarta[1].trim();
+    const seletor = /^\d+$/.test(arg) ? Number(arg) : arg;
+    const { descartada } = descartarTarefa(chatId, seletor);
+    if (descartada) {
+      await enviarTelegram(
+        chatId,
+        `Descartada: "${descartada.texto}". Foco no que sobrou.`
+      );
+    } else {
+      await enviarTelegram(chatId, "Não achei essa pendência.");
+    }
+    return true;
+  }
+
+  if (t === "checkin" || t === "/checkin" || t === "bom dia") {
+    await enviarCheckIn(chatId);
+    return true;
+  }
+
+  if (t === "/start" || t === "start" || t === "começar" || t === "comecar") {
+    await enviarTelegram(
+      chatId,
+      "Tô on. Todo dia 8h te chamo pras 3 tarefas do dia. Quando terminar uma, manda \"feito 1\" (ou o nome). Pra ver pendentes: \"pendentes\". Pra zerar uma: \"descarta 2\"."
+    );
+    return true;
+  }
+
+  return false;
+}
+
+// Monta e envia o check-in das 8h
+async function enviarCheckIn(chatId) {
+  const pendentes = getTarefasPendentes(chatId, 3);
+  const enriquecidas = enriquecerPendentes(pendentes);
+
+  let msg;
+  if (enriquecidas.length) {
+    msg = `Bom dia. Pendentes dos últimos 3 dias:\n${formatarPendentes(
+      enriquecidas
+    )}\n\nQuais suas 3 tarefas pra hoje? Manda numeradas (1, 2, 3).`;
+  } else {
+    msg = "Bom dia. Quais suas 3 tarefas pra hoje? Manda numeradas (1, 2, 3).";
+  }
+
+  await enviarTelegram(chatId, msg);
+  console.log({
+    evento: "checkin_enviado",
+    chatId,
+    pendentes: enriquecidas.length
+  });
+}
+
+// ---------------- Webhook ----------------
+
 app.post("/webhook", async (req, res) => {
   try {
     const message = req.body.message;
@@ -62,107 +164,157 @@ app.post("/webhook", async (req, res) => {
 
     const chatId = message.chat.id;
     const userText = message.text;
-    const userTextLower = userText.toLowerCase();
 
-    console.log("📩", userText);
+    console.log("📩", chatId, userText);
 
-    const user = getUser(chatId);
-    const hojeData = hoje();
+    // 1. Pega user e roda reset diário
+    let user = getUser(chatId);
+    user = resetDiarioSeNecessario(user, chatId);
 
-    // 🔥 RESET DIÁRIO (mantido da sua versão)
-    if (user.ultimoCheck !== hojeData) {
-      if (user.executouHoje) {
-        user.streak += 1;
-      } else if (user.ultimoCheck !== null) {
-        user.streak = 0;
-        user.score = Math.max(user.score - 5, 0);
-      }
-      user.executouHoje = false;
-      user.ultimoCheck = hojeData;
+    // 2. Comandos diretos primeiro (sem LLM)
+    if (await tratarComando(chatId, userText)) {
+      return res.sendStatus(200);
     }
 
-    // 🔥 AJUSTE DE SCORE POR PALAVRA-CHAVE (mantido da sua versão)
-    if (
-      userTextLower.includes("concluí") ||
-      userTextLower.includes("finalizei") ||
-      userTextLower.includes("terminei") ||
-      userTextLower.includes("fechei") ||
-      userTextLower.includes("fiz")
-    ) {
-      user.score = Math.min(user.score + 10, 100);
-      user.executouHoje = true;
-    } else if (
-      userTextLower.includes("não fiz") ||
-      userTextLower.includes("nao fiz") ||
-      userTextLower.includes("não consegui") ||
-      userTextLower.includes("nao consegui") ||
-      userTextLower.includes("depois faço") ||
-      userTextLower.includes("depois faco")
-    ) {
-      user.score = Math.max(user.score - 10, 0);
-    } else if (
-      userTextLower.includes("depois") ||
-      userTextLower.includes("mais tarde")
-    ) {
-      user.score = Math.max(user.score - 5, 0);
-    }
-
-    // 🔥 1. SAFETY NET — detecta crise por keyword antes de qualquer LLM
-    let intencaoClassificada;
+    // 3. Safety net de crise (keyword, antes do LLM)
     if (detectarCriseCritica(userText)) {
-      intencaoClassificada = {
-        intencao: "crise",
-        confianca: 1.0,
-        sinais: ["palavra-chave de crise"],
-        ambiguidade: null
-      };
-      user.em_modo_seguro = true;
-      user.ultima_classificacao_crise = new Date().toISOString();
-    } else {
-      // 🔥 2. CLASSIFICADOR (Haiku, ~10x mais barato que Sonnet)
-      intencaoClassificada = await classificarIntencao(userText);
-    }
-
-    // 🔥 3. CRISE → atalho que dispensa o responder
-    if (intencaoClassificada.intencao === "crise") {
       await enviarTelegram(chatId, RESPOSTA_CRISE);
+      updateUser(chatId, {
+        em_modo_seguro: true,
+        ultima_classificacao_crise: new Date().toISOString()
+      });
       console.log({
         evento: "crise_detectada",
         chatId,
         mensagem: userText,
-        sinais: intencaoClassificada.sinais
+        sinais: ["palavra-chave"]
       });
       return res.sendStatus(200);
     }
 
-    // 🔥 4. PAYLOAD COMPLETO PARA O RESPONDER
+    // 4. Classifier (Haiku)
+    const intencao = await classificarIntencao(userText);
+
+    // 5. Crise via LLM → resposta fixa
+    if (intencao.intencao === "crise") {
+      await enviarTelegram(chatId, RESPOSTA_CRISE);
+      updateUser(chatId, {
+        em_modo_seguro: true,
+        ultima_classificacao_crise: new Date().toISOString()
+      });
+      console.log({
+        evento: "crise_detectada",
+        chatId,
+        mensagem: userText,
+        sinais: intencao.sinais
+      });
+      return res.sendStatus(200);
+    }
+
+    // 6. Atalho: declarou_tarefas → salva e confirma sem LLM
+    if (
+      intencao.intencao === "declarou_tarefas" &&
+      intencao.tarefas_extraidas?.length
+    ) {
+      const lista = intencao.tarefas_extraidas;
+      addTarefas(chatId, lista);
+      const primeira = lista[0];
+      await enviarTelegram(
+        chatId,
+        `Anotado: ${lista.length} ${
+          lista.length === 1 ? "tarefa" : "tarefas"
+        }. Bora pela #1: "${primeira}". Quando terminar, manda "feito 1".`
+      );
+      console.log({
+        evento: "tarefas_declaradas",
+        chatId,
+        quantidade: lista.length
+      });
+      return res.sendStatus(200);
+    }
+
+    // 7. Atalho: concluiu_especifica → marca e devolve próxima pendente
+    if (
+      intencao.intencao === "concluiu_especifica" &&
+      intencao.indices_concluidos?.length
+    ) {
+      const { user: userPos, marcadas } = marcarTarefasFeitas(
+        chatId,
+        intencao.indices_concluidos
+      );
+      if (marcadas.length === 0) {
+        await enviarTelegram(
+          chatId,
+          "Não achei a tarefa. Manda \"pendentes\" pra ver a lista."
+        );
+        return res.sendStatus(200);
+      }
+      updateUser(chatId, {
+        executou_hoje: true,
+        score: Math.min(100, (userPos.score || 50) + 10 * marcadas.length)
+      });
+      const restantes = getTarefasPendentes(chatId, 3);
+      const proxima = restantes[0];
+      const nomes = marcadas.map((m) => `"${m.texto}"`).join(", ");
+      const tail = proxima
+        ? `Próxima: "${proxima.texto}".`
+        : "Lista zerada hoje.";
+      await enviarTelegram(chatId, `Feito: ${nomes}. ${tail}`);
+      console.log({
+        evento: "concluiu_especifica",
+        chatId,
+        marcadas: marcadas.map((m) => m.texto)
+      });
+      return res.sendStatus(200);
+    }
+
+    // 8. Ajuste de score genérico por intenção
+    if (intencao.intencao === "concluiu") {
+      user = updateUser(chatId, {
+        executou_hoje: true,
+        score: Math.min(100, (user.score || 50) + 10)
+      });
+    } else if (intencao.intencao === "falhou") {
+      user = updateUser(chatId, {
+        score: Math.max(0, (user.score || 50) - 10)
+      });
+    }
+
+    // 9. Payload novo pro responder
+    const pendentes = getTarefasPendentes(chatId, 3);
+    const tarefasPendentes = enriquecerPendentes(pendentes);
+
     const payload = {
       score: user.score,
       streak: user.streak,
-      executou_hoje: user.executouHoje,
-      tarefas: user.tarefas,
+      executou_hoje: user.executou_hoje,
+      tarefas_pendentes: tarefasPendentes,
       mensagem_usuario: userText,
-      intencao_classificada: intencaoClassificada,
-      ultimas_3_aberturas: user.ultimas_3_aberturas || [],
-      em_modo_seguro: user.em_modo_seguro || false
+      intencao: intencao.intencao,
+      confianca: intencao.confianca,
+      ambiguidade: intencao.ambiguidade,
+      ultimas_3_aberturas: user.ultimas_3_aberturas || []
     };
 
-    // 🔥 5. RESPONDER (Sonnet)
+    // 10. Responder (Sonnet)
     const reply = await gerarResposta(payload);
 
-    // 🔥 6. PERSISTE A NOVA ABERTURA (anti-repetição)
-    const abertura = extrairAbertura(reply);
-    pushAbertura(user, abertura);
+    // 11. Persiste abertura (anti-repetição) — como o template novo não tem "Diagnóstico:",
+    // pega a primeira linha não-vazia.
+    const abertura =
+      extrairAbertura(reply) ||
+      reply.split("\n").map((l) => l.trim()).find(Boolean);
+    pushAbertura(chatId, abertura);
 
-    // 🔥 7. ENVIA AO TELEGRAM (HTML pra formatar bold)
+    // 12. Envia
     await enviarTelegram(chatId, formatarParaTelegram(reply), true);
 
-    // 🔥 8. LOG ESTRUTURADO
+    // 13. Log
     console.log({
       evento: "resposta_enviada",
       chatId,
-      intencao: intencaoClassificada.intencao,
-      confianca: intencaoClassificada.confianca,
+      intencao: intencao.intencao,
+      confianca: intencao.confianca,
       score: user.score,
       streak: user.streak,
       tamanho_palavras: reply.split(/\s+/).length
@@ -175,6 +327,24 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// ---------------- Cron de check-in 8h ----------------
+
+cron.schedule(
+  CHECKIN_CRON,
+  async () => {
+    const ids = listarChatIds();
+    console.log({ evento: "cron_disparado", total_chats: ids.length });
+    for (const chatId of ids) {
+      try {
+        await enviarCheckIn(chatId);
+      } catch (err) {
+        console.error("cron: falha ao enviar check-in", chatId, err.message);
+      }
+    }
+  },
+  { timezone: TIMEZONE }
+);
+
 // Health check
 app.get("/", (req, res) => {
   res.send("Bot rodando 🚀");
@@ -182,4 +352,5 @@ app.get("/", (req, res) => {
 
 app.listen(3000, () => {
   console.log("🚀 Servidor rodando na porta 3000");
+  console.log(`⏰ Check-in agendado: ${CHECKIN_CRON} (${TIMEZONE})`);
 });
