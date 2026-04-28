@@ -69,6 +69,17 @@ function formatarPendentes(enriquecidas) {
     .join("\n");
 }
 
+// Reabre até `n` tarefas mais recentes (de qualquer data). Retorna quantas reabriu.
+function reabrirNUltimas(chatId, n) {
+  let count = 0;
+  while (count < n) {
+    const { reaberta } = reabrirTarefa(chatId, 1);
+    if (!reaberta) break;
+    count++;
+  }
+  return count;
+}
+
 // Reset diário: se mudou de dia, atualiza streak/score
 function resetDiarioSeNecessario(user, userId) {
   const hojeData = hoje();
@@ -89,7 +100,14 @@ function resetDiarioSeNecessario(user, userId) {
 async function tratarComando(chatId, userText) {
   const t = userText.trim().toLowerCase();
 
-  if (t === "pendentes" || t === "/pendentes" || t === "lista") {
+  if (
+    t === "pendentes" ||
+    t === "pendente" ||
+    t === "/pendentes" ||
+    t === "/pendente" ||
+    t === "lista" ||
+    t === "listar"
+  ) {
     const pendentes = getTarefasPendentes(chatId, 3);
     if (!pendentes.length) {
       await enviarTelegram(chatId, "Sem pendentes nos últimos 3 dias.");
@@ -120,21 +138,9 @@ async function tratarComando(chatId, userText) {
     return true;
   }
 
-  // "reabrir tudo" / "reabrir todas" / "errei tudo" → desfaz todas finalizadas hoje
-  if (
-    /^(reabr[ae]?[ir]?\s+(tudo|todas?))|errei\s+(tudo|todas?)$/i.test(t)
-  ) {
-    const hojeStr = hoje();
-    const finalizadasHoje = getTarefasFinalizadasNoIntervalo(
-      chatId,
-      hojeStr,
-      hojeStr
-    );
-    let count = 0;
-    for (let i = 0; i < finalizadasHoje.length; i++) {
-      const r = reabrirTarefa(chatId, 1);
-      if (r.reaberta) count++;
-    }
+  // "reabrir tudo" / "reabra tudo" / "reabre tudo" / "reabrir todas" / "errei tudo"
+  if (/^(reabr\w*\s+(tudo|todas?|todos)|errei\s+(tudo|todas?|todos))$/i.test(t)) {
+    const count = reabrirNUltimas(chatId, Infinity);
     if (count > 0) {
       await enviarTelegram(
         chatId,
@@ -146,8 +152,26 @@ async function tratarComando(chatId, userText) {
     return true;
   }
 
-  // Reabrir tarefa marcada por engano: "reabrir 1" / "reabre 1" / "reabrir relatório"
-  const mReabrir = t.match(/^reabr[ae]?[ir]?\s+(.+)$/);
+  // "reabra as 3 últimas" / "reabra 3 últimas" / "reabrir últimas 2" / "reabrir 2 últimas"
+  const mReabrirN = t.match(
+    /^reabr\w*\s+(?:as\s+)?(?:(\d+)\s+(?:[uú]ltim\w+))|reabr\w*\s+(?:as\s+)?(?:[uú]ltim\w+)\s+(\d+)$/i
+  );
+  if (mReabrirN) {
+    const n = Number(mReabrirN[1] || mReabrirN[2]);
+    const count = reabrirNUltimas(chatId, n);
+    if (count > 0) {
+      await enviarTelegram(
+        chatId,
+        `Reabri ${count} ${count === 1 ? "tarefa" : "tarefas"}. Pendentes restauradas.`
+      );
+    } else {
+      await enviarTelegram(chatId, "Nada finalizado pra reabrir.");
+    }
+    return true;
+  }
+
+  // "reabrir 1" / "reabra 1" / "reabre relatório"
+  const mReabrir = t.match(/^reabr\w*\s+(.+)$/);
   if (mReabrir) {
     const arg = mReabrir[1].trim();
     const seletor = /^\d+$/.test(arg) ? Number(arg) : arg;
@@ -160,7 +184,7 @@ async function tratarComando(chatId, userText) {
     } else {
       await enviarTelegram(
         chatId,
-        "Não achei nenhuma tarefa finalizada com isso. Manda o número (a 1 é a mais recente)."
+        "Não achei nenhuma tarefa finalizada com isso. Manda o número (a 1 é a mais recente) ou \"reabrir tudo\"."
       );
     }
     return true;
@@ -183,7 +207,7 @@ async function tratarComando(chatId, userText) {
   // "manter" / "msm" / "essas msm" / "as mesmas" / "essas 3" / "essas mesmas"
   // → confirma que o usuário vai continuar nas pendentes existentes
   if (
-    /^(msm|mesm[ao]s?|as mesm[ao]s?|essas msm|essas mesm[ao]s?|essas 3 msm|essas tr[eê]s|manter|mant[eé]m|continua[r]?|sigo nessas|essas mesmas|essas 3)$/i.test(
+    /^(msm|mesm[ao]s?|as mesm[ao]s?|essas msm|essas mesm[ao]s?|essas \d+\s*(msm|mesm[ao]s?)?|essas tr[eê]s\s*(msm|mesm[ao]s?)?|manter|mant[eé]m|continua[r]?|sigo nessas|essas mesmas|essas \d+)$/i.test(
       t
     )
   ) {
