@@ -17,7 +17,10 @@ import {
   addTarefas,
   marcarTarefasFeitas,
   descartarTarefa,
+  reabrirTarefa,
   getTarefasPendentes,
+  getTarefasFinalizadasNoIntervalo,
+  deslocarData,
   listarChatIds
 } from "./bot/storage.js";
 
@@ -117,6 +120,89 @@ async function tratarComando(chatId, userText) {
     return true;
   }
 
+  // "reabrir tudo" / "reabrir todas" / "errei tudo" → desfaz todas finalizadas hoje
+  if (
+    /^(reabr[ae]?[ir]?\s+(tudo|todas?))|errei\s+(tudo|todas?)$/i.test(t)
+  ) {
+    const hojeStr = hoje();
+    const finalizadasHoje = getTarefasFinalizadasNoIntervalo(
+      chatId,
+      hojeStr,
+      hojeStr
+    );
+    let count = 0;
+    for (let i = 0; i < finalizadasHoje.length; i++) {
+      const r = reabrirTarefa(chatId, 1);
+      if (r.reaberta) count++;
+    }
+    if (count > 0) {
+      await enviarTelegram(
+        chatId,
+        `Reabri ${count} ${count === 1 ? "tarefa" : "tarefas"} de hoje. Pendentes restauradas.`
+      );
+    } else {
+      await enviarTelegram(chatId, "Nada finalizado hoje pra reabrir.");
+    }
+    return true;
+  }
+
+  // Reabrir tarefa marcada por engano: "reabrir 1" / "reabre 1" / "reabrir relatório"
+  const mReabrir = t.match(/^reabr[ae]?[ir]?\s+(.+)$/);
+  if (mReabrir) {
+    const arg = mReabrir[1].trim();
+    const seletor = /^\d+$/.test(arg) ? Number(arg) : arg;
+    const { reaberta } = reabrirTarefa(chatId, seletor);
+    if (reaberta) {
+      await enviarTelegram(
+        chatId,
+        `Reaberta: "${reaberta.texto}". Voltou pras pendentes.`
+      );
+    } else {
+      await enviarTelegram(
+        chatId,
+        "Não achei nenhuma tarefa finalizada com isso. Manda o número (a 1 é a mais recente)."
+      );
+    }
+    return true;
+  }
+
+  // "Errei" / "errado" / "desfaz" → reabre a última finalizada
+  if (t === "errei" || t === "errado" || t === "desfaz" || t === "desfazer") {
+    const { reaberta } = reabrirTarefa(chatId, 1);
+    if (reaberta) {
+      await enviarTelegram(
+        chatId,
+        `Reaberta: "${reaberta.texto}". Se foi mais de uma, manda "reabrir 2", "reabrir 3"...`
+      );
+    } else {
+      await enviarTelegram(chatId, "Nada finalizado pra reabrir.");
+    }
+    return true;
+  }
+
+  // "manter" / "msm" / "essas msm" / "as mesmas" / "essas 3" / "essas mesmas"
+  // → confirma que o usuário vai continuar nas pendentes existentes
+  if (
+    /^(msm|mesm[ao]s?|as mesm[ao]s?|essas msm|essas mesm[ao]s?|essas 3 msm|essas tr[eê]s|manter|mant[eé]m|continua[r]?|sigo nessas|essas mesmas|essas 3)$/i.test(
+      t
+    )
+  ) {
+    const pendentes = getTarefasPendentes(chatId, 3);
+    if (!pendentes.length) {
+      await enviarTelegram(
+        chatId,
+        "Não tem pendentes pra manter. Manda suas 3 tarefas de hoje."
+      );
+      return true;
+    }
+    const enriquecidas = enriquecerPendentes(pendentes);
+    await enviarTelegram(
+      chatId,
+      `Beleza, foco nessas. Bora pela #1: "${enriquecidas[0].texto}". Quando terminar, manda "feito 1".`
+    );
+    return true;
+  }
+
   if (t === "checkin" || t === "/checkin" || t === "bom dia") {
     await enviarCheckIn(chatId);
     return true;
@@ -125,7 +211,17 @@ async function tratarComando(chatId, userText) {
   if (t === "/start" || t === "start" || t === "começar" || t === "comecar") {
     await enviarTelegram(
       chatId,
-      "Tô on. Todo dia 8h te chamo pras 3 tarefas do dia. Quando terminar uma, manda \"feito 1\" (ou o nome). Pra ver pendentes: \"pendentes\". Pra zerar uma: \"descarta 2\"."
+      [
+        "Tô on. Todo dia 8h te chamo pras 3 tarefas do dia.",
+        "",
+        "Comandos:",
+        "• \"feito 1\" / \"ok 2 e 3\" — marca como concluída",
+        "• \"pendentes\" — lista o que tá em aberto",
+        "• \"descarta 2\" — zera uma pendência",
+        "• \"reabrir 1\" / \"errei\" — desfaz a última marcada",
+        "• \"manter\" / \"msm\" — continua nas pendentes (não cria novas)",
+        "• \"bom dia\" / \"checkin\" — força o check-in fora do horário"
+      ].join("\n")
     );
     return true;
   }
@@ -282,13 +378,49 @@ app.post("/webhook", async (req, res) => {
 
     // 9. Payload novo pro responder
     const pendentes = getTarefasPendentes(chatId, 3);
-    const tarefasPendentes = enriquecerPendentes(pendentes);
+    const enriquecidas = enriquecerPendentes(pendentes);
+    const pendentesHoje = enriquecidas.filter((t) => t.idade_dias === 0);
+    const pendentesAtrasadas = enriquecidas.filter((t) => t.idade_dias > 0);
+
+    const hojeStr = hoje();
+    const ontemStr = deslocarData(hojeStr, -1);
+    const finalizadasHoje = getTarefasFinalizadasNoIntervalo(
+      chatId,
+      hojeStr,
+      hojeStr
+    );
+    const finalizadasOntem = getTarefasFinalizadasNoIntervalo(
+      chatId,
+      ontemStr,
+      ontemStr
+    );
+
+    const historico = {
+      hoje: {
+        feitas: finalizadasHoje
+          .filter((t) => t.status === "feita")
+          .map((t) => t.texto),
+        descartadas: finalizadasHoje
+          .filter((t) => t.status === "descartada")
+          .map((t) => t.texto)
+      },
+      ontem: {
+        feitas: finalizadasOntem
+          .filter((t) => t.status === "feita")
+          .map((t) => t.texto),
+        descartadas: finalizadasOntem
+          .filter((t) => t.status === "descartada")
+          .map((t) => t.texto)
+      }
+    };
 
     const payload = {
       score: user.score,
       streak: user.streak,
       executou_hoje: user.executou_hoje,
-      tarefas_pendentes: tarefasPendentes,
+      pendentes_hoje: pendentesHoje,
+      pendentes_atrasadas: pendentesAtrasadas,
+      historico,
       mensagem_usuario: userText,
       intencao: intencao.intencao,
       confianca: intencao.confianca,

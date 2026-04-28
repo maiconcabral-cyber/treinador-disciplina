@@ -176,6 +176,40 @@ export function descartarTarefa(userId, seletor) {
   return { user: userAtualizado, descartada: tarefas[i] };
 }
 
+// Reabre tarefa que foi marcada feita ou descartada por engano.
+// `seletor` aceita: número 1-based dentro das finalizadas recentes (mais recentes primeiro),
+// string com trecho do texto, ou id "t_xxx".
+export function reabrirTarefa(userId, seletor) {
+  const user = getUser(userId);
+  const tarefas = [...(user.tarefas || [])];
+
+  // Finalizadas (feita/descartada), mais recentes primeiro
+  const finalizadas = tarefas
+    .filter((t) => t.status === "feita" || t.status === "descartada")
+    .sort((a, b) => (b.concluidaEm || "").localeCompare(a.concluidaEm || ""));
+
+  let alvo = null;
+  if (typeof seletor === "number") {
+    const idx = seletor - 1;
+    if (idx >= 0 && idx < finalizadas.length) alvo = finalizadas[idx];
+  } else if (typeof seletor === "string") {
+    if (seletor.startsWith("t_")) {
+      alvo = tarefas.find(
+        (t) => t.id === seletor && t.status !== "pendente"
+      );
+    } else {
+      const q = seletor.toLowerCase();
+      alvo = finalizadas.find((t) => t.texto.toLowerCase().includes(q));
+    }
+  }
+
+  if (!alvo) return { user, reaberta: null };
+  const i = tarefas.findIndex((t) => t.id === alvo.id);
+  tarefas[i] = { ...tarefas[i], status: "pendente", concluidaEm: null };
+  const userAtualizado = updateUser(userId, { tarefas });
+  return { user: userAtualizado, reaberta: tarefas[i] };
+}
+
 // Tarefas pendentes nos últimos `dias` dias (inclui hoje).
 export function getTarefasPendentes(userId, dias = 3) {
   const user = getUser(userId);
@@ -185,4 +219,23 @@ export function getTarefasPendentes(userId, dias = 3) {
   return (user.tarefas || []).filter(
     (t) => t.status === "pendente" && t.criadaEm >= limiteStr
   );
+}
+
+// Tarefas marcadas como feita ou descartada num intervalo (datas YYYY-MM-DD inclusivas).
+export function getTarefasFinalizadasNoIntervalo(userId, dataInicio, dataFim) {
+  const user = getUser(userId);
+  return (user.tarefas || []).filter(
+    (t) =>
+      (t.status === "feita" || t.status === "descartada") &&
+      t.concluidaEm &&
+      t.concluidaEm >= dataInicio &&
+      t.concluidaEm <= dataFim
+  );
+}
+
+// Helper: soma N dias a uma data YYYY-MM-DD e retorna nova data YYYY-MM-DD.
+export function deslocarData(dataStr, dias) {
+  const d = new Date(dataStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + dias);
+  return d.toISOString().split("T")[0];
 }

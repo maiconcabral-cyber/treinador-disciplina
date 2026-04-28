@@ -56,7 +56,9 @@ Devolva **apenas** este JSON, sem texto antes ou depois:
 4. **Sarcasmo conta como o conteúdo literal invertido.** "Claro, fiz tudo, sou um milagre" → `falhou` com `ambiguidade` preenchida.
 5. **Desabafo sem ação nem crise** → `neutro`.
 6. **Lista numerada com 2+ itens** → `declarou_tarefas` (mesmo se não tiver verbo introdutor).
-7. **Cita índice ou nome de tarefa + verbo de conclusão** → `concluiu_especifica` (não `concluiu` genérico).
+7. **2+ linhas curtas separadas por quebra de linha**, cada uma sendo uma frase nominal ou verbal curta (≤ 8 palavras) → `declarou_tarefas` com confiança 0.75-0.85, **mesmo sem numeração, bullets ou verbo introdutor**. Exemplos disparadores: substantivos ("Orçamentos e NF X", "Reunião cliente"), infinitivos ("Vender em Y", "Terminar obra"), nomes próprios de projetos. Extraia cada linha como tarefa.
+8. **Cita índice ou nome de tarefa + verbo de conclusão** → `concluiu_especifica` (não `concluiu` genérico).
+9. **CUIDADO COM "MESMO/MESMAS"**: expressões como "essas 3 mesmas", "essas msm", "as mesmas", "manter", "continuar com essas", "sigo nessas", "essas três" **NÃO** indicam conclusão nem nova lista. Indicam que o usuário quer manter as pendentes anteriores. Classifique como `neutro` com `ambiguidade` apontando o conflito. Esses casos são tratados por atalho fora do LLM, mas se chegarem aqui, **nunca** classifique como `concluiu_especifica` ou `declarou_tarefas`. Verbo de conclusão (fiz/feito/concluí/terminei) precisa estar **explícito** — "mesm/mesmas" sozinho não conta.
 
 ---
 
@@ -72,6 +74,16 @@ Devolva **apenas** este JSON, sem texto antes ou depois:
 **Entrada:** "hoje vou: terminar relatório, responder emails e treinar"
 ```json
 {"intencao": "declarou_tarefas", "confianca": 0.9, "sinais": ["hoje vou", "lista com vírgula"], "ambiguidade": null, "tarefas_extraidas": ["terminar relatório", "responder emails", "treinar"], "indices_concluidos": null}
+```
+
+**Entrada:** "Orçamentos e NF Ibirarema\nObra E inauguração\nProcesso Canitar"
+```json
+{"intencao": "declarou_tarefas", "confianca": 0.8, "sinais": ["3 linhas separadas", "frases nominais"], "ambiguidade": null, "tarefas_extraidas": ["Orçamentos e NF Ibirarema", "Obra E inauguração", "Processo Canitar"], "indices_concluidos": null}
+```
+
+**Entrada:** "Reunião cliente X\nFechar contrato\nAcademia"
+```json
+{"intencao": "declarou_tarefas", "confianca": 0.85, "sinais": ["3 linhas curtas", "tarefas implícitas"], "ambiguidade": null, "tarefas_extraidas": ["Reunião cliente X", "Fechar contrato", "Academia"], "indices_concluidos": null}
 ```
 
 **Entrada:** "fiz a 1 e a 3"
@@ -144,4 +156,19 @@ Devolva **apenas** este JSON, sem texto antes ou depois:
 **Entrada:** "ok"
 ```json
 {"intencao": "neutro", "confianca": 0.3, "sinais": ["ok"], "ambiguidade": "Resposta vazia.", "tarefas_extraidas": null, "indices_concluidos": null}
+```
+
+**Entrada:** "essas 3 msm"
+```json
+{"intencao": "neutro", "confianca": 0.6, "sinais": ["essas 3", "msm"], "ambiguidade": "Quer manter as pendentes — NÃO é conclusão nem nova lista.", "tarefas_extraidas": null, "indices_concluidos": null}
+```
+
+**Entrada:** "as mesmas"
+```json
+{"intencao": "neutro", "confianca": 0.6, "sinais": ["as mesmas"], "ambiguidade": "Confirma manutenção das pendentes existentes.", "tarefas_extraidas": null, "indices_concluidos": null}
+```
+
+**Entrada:** "manter essas"
+```json
+{"intencao": "neutro", "confianca": 0.65, "sinais": ["manter", "essas"], "ambiguidade": "Manter pendentes — não é conclusão.", "tarefas_extraidas": null, "indices_concluidos": null}
 ```
